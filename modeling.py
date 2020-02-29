@@ -4,7 +4,9 @@ import pandas as pd
 
 from sklearn import metrics, model_selection, preprocessing, feature_selection
 from sklearn import tree, ensemble, neural_network, linear_model, svm
-from skmultilearn.model_selection import IterativeStratification
+from sklearn.base import clone
+# from skmultilearn.model_selection import IterativeStratification
+from scipy import stats
 
 from nevergrad import instrumentation as instru
 from nevergrad.optimization import optimizerlib
@@ -20,37 +22,48 @@ rcParams.update({'figure.autolayout': True,
                  'ytick.right': True,
                  'ytick.direction': 'in',
                  'font.sans-serif': 'Arial',
-                 'font.size': 14,
+                 'font.size': 16,
                  'savefig.dpi': 300,
                  'figure.dpi': 96
                 })
 
 
-class MultiLabelClassifier():
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+def median_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.median(np.abs((y_true - y_pred) / y_true)) * 100
+
+
+class Regressor():
     """
     Class for the evaluation of models and hyperparameters
-    for multi-label classification problems
+    for regression problems
     """
     
     def __init__(self, estimator, name='multi-label-classifier'):
         """
-        estimator must be a sklearn callable e.g.
-        ensemble.RandomForestClassifier
+        estimator must be an instance of sklearn model e.g.
+        ensemble.RandomForestClassifier()
         """
         
         self.estimator = estimator
         self.name = name
         self.last_scores = None
+        self.last_hypes = {}
         self.best_hypes = {}
+        self.last_splits = []
         
     
-    def evaluate(self, X, y, hypes={}, n_splits=5, average=None):
+    def evaluate(self, X, y, hypes={}, n_splits=5, shuffle=True, standardize=True, groups=None):
 
         """
         Evaluate the estimator on X and y with given hyperparameters,
-        return a dataframe of cross-validation results including precision,
-        recall, F1 score, and class surpports for both training and validation
-        of each fold
+        return a dataframe of cross-validation results including
+        mean absolute error, mean absolute percentage error, pearson and spearman
+        for both training and validation of each fold
 
         Inputs:
         ------
@@ -60,114 +73,158 @@ class MultiLabelClassifier():
 
         hypes: a dictionary of estimator hyperparameters
         n_splits: the number of cross-validation splits to use
-        average: type of averaging (over classes) to use for scoring metrics (if any) (don't use this)
+        standardize: whether to standardize data at each fold
+        groups: must contain a list-like of shape (samples,) with some type of group label for each sample. If passed, LOGO-CV will be used by default
 
         Returns:
         ------
         scores: a DataFrame with training and validation scores from every split of cross validation
-        model_i: an instance of "estimator" fit during the last fold of cross-validation
         """
-
+        
+        ### SET HYPERPARAMETERS ###
+        model = clone(self.estimator)  # Gotta do this otherwise funky things happen
+        model.set_params(**hypes)
+        
         ### INITIALIZE SCORING DATAFRAME ###
         fractions = ['train', 'val']
-        scoring_metrics = ['hamming', 'precision', 'recall', 'F1', 'support']
-        score_columns = pd.MultiIndex.from_product([fractions, scoring_metrics])
-        scores = pd.DataFrame(columns=score_columns)
+        scoring_metrics = ['mae', 'mape', 'medape', 'pearson', 'spearman']
+        score_columns = pd.MultiIndex.from_product([fractions, scoring_metrics])  # This sets up a heirarchical index for the results dataframe
+        score = pd.DataFrame(columns=score_columns)
 
         ### SET UP X-VALIDATION ###
-        # cv = model_selection.KFold(n_splits=n_splits,
-        #                                shuffle=True)
-        cv = IterativeStratification(n_splits=n_splits, order=1)
+        
+        if groups is not None:
+            cv = model_selection.LeaveOneGroupOut()
+            splitter = enumerate(cv.split(X,y,groups))
+        else:
+            cv = model_selection.KFold(n_splits=n_splits, shuffle=shuffle)
+            splitter = enumerate(cv.split(X,y))
 
         ### RUN CV AND SCORE MODEL ###
-        for idx, (train, val) in enumerate(cv.split(X,y)):
+        last_splits = []  # Keep track of split indices for forensics
+        for idx, (train, val) in splitter:
 
-            X_train = X[train,:]; y_train = y[train,:]
-            X_val = X[val,:]; y_val = y[val,:]
+            X_train = X.iloc[train,:]; y_train = y.iloc[train]
+            X_val = X.iloc[val,:]; y_val = y.iloc[val]
+            
+            if standardize:
+                std = preprocessing.StandardScaler()
+                std.fit(X_train)
+                X_train, X_val = std.transform(X_train), std.transform(X_val)
 
     #         if idx==0:
     #             for v in ['X_train','y_train','X_val','y_val']:
     #                 print('{} shape: {}'.format(v, eval('{}.shape'.format(v))))
 
             ### INSTANTIATE AND FIT MODEL ###
-            model_i = self.estimator(**hypes)
-            model_i.fit(X_train, y_train)
+            last_splits.append((train, val))
+            model.fit(X_train, y_train)
 
             for frac in ['train','val']:
+                
+                # y_true will either be y_train or y_val depending on what 'frac' is. Kind of hacky.
+                y_true = eval('y_'+frac)
+                y_pred = model.predict(eval('X_'+frac))
+                
+                # Calculate MAE
+                score.loc[idx, (frac,'mae')] = \
+                    metrics.mean_absolute_error(y_true, y_pred)
+                        
+                # Calculate MAPE
+                score.loc[idx, (frac,'mape')] = \
+                    mean_absolute_percentage_error(y_true, y_pred)
+                    
+                # Calculate MedAPE
+                score.loc[idx, (frac,'medape')] = \
+                    median_absolute_percentage_error(y_true, y_pred)
 
-                # Calculate Hamming loss
-                scores.loc[idx, (frac,'hamming')] = \
-                    metrics.hamming_loss(eval('y_'+frac),
-                                         model_i.predict(eval('X_'+frac))
-                                        )
+                # Calculate pearson
+                score.loc[idx, (frac,'pearson')] = \
+                    stats.pearsonr(y_true, y_pred)[0]
 
-                # Calculate Precision, Recall, F1
-                scores.loc[idx, (frac,'precision')], \
-                scores.loc[idx, (frac,'recall')], \
-                scores.loc[idx, (frac,'F1')], \
-                scores.loc[idx, (frac,'support')] = \
-                    metrics.precision_recall_fscore_support(eval('y_'+frac),
-                                                            model_i.predict(eval('X_'+frac)),
-                                                            average=average
-                                                           )
+                # Calculate spearman
+                score.loc[idx, (frac,'spearman')] = \
+                    stats.spearmanr(y_true, y_pred)[0]
+
+        self.estimator = model
+        self.last_scores = score
+        self.last_hypes = hypes
+        self.last_splits = last_splits
+
+        return score
         
-        self.last_scores = scores
-
-        return scores
-    
-    
-    def plot_metric_byclass(self, fraction='val', metric='F1', ax=None, figsize=(5,4),
-                            classes=np.arange(10,100,10).astype(int)):
+        
+    def parity_plot(self, X, y, hypes='current', shuffle=True, standardize=True, test_size=0.2,
+                    ax=None, figsize=(5,5), lim=450, title=''):
         """
-        Plot the results of model evaluation
-        Y-axis is the chosen metric,
-        X-axis is the classes from 10-90% Element A
-        Values are the mean metric across n-fold cross validation,
-        Shaded area is the standard deviation across n-fold cross validation
+        Perform train/val split, fit and predict, plot y_pred vs. y_true
+        with a dashed line at y=x for both train and val fractions
 
-        Inputs
+        Inputs:
         ------
-        fraction: 'train' or 'val'
-        metric: the name of a metric to plot
-        ax: axes to plot on - if None will create new figure
-        figsize: kwarg for plt.figure()
+        X: an array with shape = (samples, features), and
+        y: an array with shape = (samples,), where each entry is a 1-D array of class labels
 
-        Outputs
+        hypes: 'current' (use whatever was used when evaluate() was last called), 'best' (use whatever was obtained by optimize_hyperparameters), or just a dictionary of valid hyperparameters for the estimator
+        shuffle: whether to shuffle data before splitting
+        standardize: whether to standardize data after splitting
+        test_size: fraction of data to use for validation
+        ax: pass a matplotlib Axes onto which the plot will be drawn - if None, will create a new figure
+        figsize: (inches width, inches height)
+        lim: upper limit for the x/y axes (zoom in on higher-density region)
+        title: title for the plot
+
+        Returns:
         ------
-        Axes object with the new series on it
+        ax: the Axes object on which the plot was drawn
         """
-
-        if self.last_scores is None:
-            raise AttributeError('No scores to plot; evaluate first')
-        df = self.last_scores
-        name = self.name
-
-        ### CALCULATE VALIDATION STATS ###
-        means = df.agg(lambda col: np.mean(col.values))['val',metric]
-        stds = df.agg(lambda col: np.std(col.values))['val',metric]
-
-        if classes is None:
-            classes = list(range(len(means)))
+        
+        ### SPLIT + STANDARDIZE DATA ###
+        X_train, X_val, y_train, y_val = \
+            model_selection.train_test_split(X, y, shuffle=shuffle, test_size=test_size)
+        
+        if standardize:
+            std = preprocessing.StandardScaler()
+            std.fit(X_train)
+            X_train, X_val = std.transform(X_train), std.transform(X_val)
+        
+        ### FIT + PREDICT ###
+        model = clone(self.estimator)
+        if hypes=='current':
+            model.set_params(**self.last_hypes)
+        elif hypes=='best':
+            model.set_params(**self.best_hypes)
+        else:
+            try:
+                model.set_params(**hypes)
+            except:
+                print('Passed hypes were invalid')
+        
+        model.fit(X_train, y_train)
 
         ### BUILD PLOTS ###
         if ax is None:
             plt.figure(figsize=figsize)
             ax=plt.gca()
 
-        ax.plot(classes, means, '-', alpha=0.8, label=name)
-        ax.fill_between(classes, means-stds, means+stds, alpha=0.2)
+        for frac in ['train','val']:
+            y_true = eval('y_'+frac)
+            y_pred = model.predict(eval('X_'+frac))
+            ax.scatter(y_true, y_pred, alpha=0.7)
 
-        ax.set_ylabel('{} ({}-fold CV)'.format(metric, df.shape[0]))
-        ax.set_xlabel('% Element A (class)')
-        ax.set_ylim([0,1])
-        ax.set_xticks(classes)
+        ax.plot((0,lim), (0,lim), linestyle='--', color='xkcd:gray')
+        ax.set_aspect('equal','datalim')
+        ax.set_xlim([-10,lim]); ax.set_ylim([-10,lim])
+        ax.set_xlabel(r'True $\Delta H$')
+        ax.set_ylabel(r'Predicted $\Delta H$')
+        ax.legend(['y=x', 'train', 'val'])
+        plt.title(title)
 
         return ax
     
     
     def optimize_hyperparameters(self, hype_instru_dict, X, y, n_splits=5,
-                                 average='weighted', metric='F1',
-                                 budget=100, n_workers=4):
+                                 metric='mape', lower_better=True, budget=100, n_workers=4):
         """
         Optimize the hyperparameters of the estimator within specified
         hyperparameter ranges, using training data X and y
@@ -182,10 +239,9 @@ class MultiLabelClassifier():
         }
         
         X: feature array, (samples, feats)
-        y: class labels, (samples, classes)
+        y: target values, (samples, )
         n_splits: number of folds for CV at each objective function evaluation
-        average: what type of averaging to use for metric ('weighted','micro','macro')
-        metric: 'F1', 'precision', 'recall'
+        metric: 'mae', 'mape', 'pearson', 'spearman'
         budget: number of allowable objective function evaluations
         n_workers: number of parallel workers to allocate
 
@@ -202,20 +258,24 @@ class MultiLabelClassifier():
                      'X':X,
                      'y':y,
                      'n_splits':n_splits,
-                     'average':average,
                      'metric':metric}
         
         # The tricky part here is that obj_fun must accept the instrumented
         # hyperparameter variables as its first positional arguments, but then
         # the evaluate() method takes them as a kwarg, so we have to re-build the
         # hypes kwarg dict inside the lambda........
-        obj_fun = (lambda *hype_args, **eval_args:
-                   -self.evaluate(eval_args['X'], eval_args['y'],
-                                  hypes = {k:v for k,v in zip(eval_args['hype_names'],hype_args)},
-                                  n_splits = eval_args['n_splits'],
-                                  average=eval_args['average'])['val',eval_args['metric']].mean().mean()
-                  )
-        # At the moment, assumes we're optimizing a metric where higher is better
+        if lower_better:
+            obj_fun = (lambda *hype_args, **eval_args:
+                       self.evaluate(eval_args['X'], eval_args['y'],
+                                     hypes = {k:v for k,v in zip(eval_args['hype_names'],hype_args)},
+                                     n_splits = eval_args['n_splits'])['val',eval_args['metric']].mean()
+                      )
+        else:
+            obj_fun = (lambda *hype_args, **eval_args:
+                       -self.evaluate(eval_args['X'], eval_args['y'],
+                                      hypes = {k:v for k,v in zip(eval_args['hype_names'],hype_args)},
+                                      n_splits = eval_args['n_splits'])['val',eval_args['metric']].mean()
+                      )
         
         ifunc = instru.InstrumentedFunction(obj_fun, *hype_args, **eval_args)
         
@@ -233,6 +293,7 @@ class MultiLabelClassifier():
         ### CONVERT OUTPUTS BACK TO HP-SPACE ###
         best_hype_values, other_kwargs = ifunc.convert_to_arguments(recommended)
         self.best_hypes = {k:v for k,v in zip(hype_names, best_hype_values)}
+        self.last_hypes = self.best_hypes
         print('Recommended hyperparameters: ', self.best_hypes)
         
         return self.best_hypes
